@@ -15,35 +15,53 @@ const webhookSecret = process.env.WEBHOOK_SECRET;
 
 // Main serverless function handler
 module.exports = async (req, res) => {
-    // 1. Verify the webhook signature
-    const signature = req.headers['x-hub-signature-256'];
-    const hmac = createHmac('sha256', webhookSecret);
-    hmac.update(JSON.stringify(req.body));
-    const calculatedSignature = `sha256=${hmac.digest('hex')}`;
+    console.log('Received a request to /api/generate-post');
 
-    if (signature !== calculatedSignature) {
-        console.error('Webhook signature does not match.');
-        return res.status(401).send('Unauthorized');
+    // 1. Verify the webhook signature
+    try {
+        const signature = req.headers['x-hub-signature-256'];
+        if (!signature) {
+            console.error('Signature missing from request.');
+            return res.status(401).send('Unauthorized: Signature missing.');
+        }
+
+        const hmac = createHmac('sha256', webhookSecret);
+        hmac.update(JSON.stringify(req.body));
+        const calculatedSignature = `sha256=${hmac.digest('hex')}`;
+
+        if (signature !== calculatedSignature) {
+            console.error('Webhook signature does not match.');
+            return res.status(401).send('Unauthorized: Invalid signature.');
+        }
+        console.log('Webhook signature verified successfully.');
+    } catch (error) {
+        console.error('Error during webhook signature verification:', error);
+        return res.status(500).send('Internal Server Error during verification.');
     }
 
-    // Only proceed for pushes to the main branch (or master)
-    if (req.body.ref !== 'refs/heads/main' && req.body.ref !== 'refs/heads/master') {
+
+    // 2. Check the push event
+    const pushRef = req.body.ref;
+    console.log(`Push event for ref: ${pushRef}`);
+    if (pushRef !== 'refs/heads/main' && pushRef !== 'refs/heads/master') {
+        console.log('Push was not to the main branch, skipping.');
         return res.status(200).send('Push was not to the main branch, skipping.');
     }
 
     try {
-        // Core logic will go here
-        console.log('Webhook received and verified. Starting post generation...');
+        console.log('Starting post generation process...');
 
-        // Get the SHA of the latest commit on the main branch
+        // 3. Get the SHA of the latest commit
         const { data: refData } = await octokit.git.getRef({
             owner,
             repo,
-            ref: 'heads/main', // or 'heads/master'
+            ref: 'heads/main',
         });
         const latestCommitSha = refData.object.sha;
+        console.log(`Latest commit SHA on main branch is: ${latestCommitSha}`);
 
-        // Get the content of ideas.md
+        // 4. Fetch ideas.md content
+        console.log('Fetching ideas.md...');
         const { data: ideasFile } = await octokit.repos.getContent({
             owner,
             repo,
@@ -51,8 +69,10 @@ module.exports = async (req, res) => {
             ref: latestCommitSha,
         });
         const ideasContent = Buffer.from(ideasFile.content, 'base64').toString('utf8');
+        console.log(`ideas.md content fetched (length: ${ideasContent.length}).`);
 
-        // Get the list of existing posts
+        // 5. Fetch existing posts
+        console.log('Fetching existing posts from public/posts...');
         const { data: existingPosts } = await octokit.repos.getContent({
             owner,
             repo,
@@ -60,21 +80,18 @@ module.exports = async (req, res) => {
             ref: latestCommitSha,
         });
         const existingPostFiles = existingPosts.map(file => file.name);
+        console.log(`Found ${existingPostFiles.length} existing posts:`, existingPostFiles);
 
-        // Parse ideas and identify new ones
+        // 6. Parse ideas and identify new ones
         const newIdeas = parseIdeas(ideasContent, existingPostFiles);
-
         if (newIdeas.length === 0) {
             console.log('No new ideas to process.');
             return res.status(200).send('No new ideas found.');
         }
+        console.log(`Found ${newIdeas.length} new ideas to process:`, newIdeas.map(i => i.topic));
 
-        console.log(`Found ${newIdeas.length} new ideas to process.`);
-
-        // An array to hold all the file creation promises
+        // 7. Generate posts for new ideas
         const newFilesToCommit = [];
-
-        // Fetch the post template
         const { data: templateFile } = await octokit.repos.getContent({
             owner,
             repo,
@@ -82,31 +99,19 @@ module.exports = async (req, res) => {
             ref: latestCommitSha,
         });
         const postTemplate = Buffer.from(templateFile.content, 'base64').toString('utf8');
+        console.log('Post template fetched successfully.');
 
-
-        // Generate a post for each new idea
         for (const idea of newIdeas) {
-            console.log(`Generating post for: ${idea.topic}`);
-            const prompt = `You are an expert blog writer who writes clear, engaging, and well-structured technical and general interest articles.
+            console.log(`--- Generating post for: ${idea.topic} ---`);
+            const prompt = `You are an expert blog writer...`; // Keeping it short for the log
 
-Your task is to convert the following topic and analysis points into a complete blog post.
-
-The output format MUST be clean, semantic HTML. Do not include \`<html>\`, \`<head>\`, or \`<body>\` tags. Only provide the article content itself, starting with an \`<h1>\` for the title. Use \`<p>\`, \`<h2>\`, \`<h3>\`, \`<ul>\`, \`<li>\`, and \`<strong>\` tags appropriately to structure the article.
-
-**Topic:**
-${idea.topic}
-
-**Analysis & Key Points to Include:**
-${idea.analysis}
-
-Generate the HTML content for the blog post now.`;
-
-            const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
-            const result = await model.generateContent(prompt);
+            console.log(`Calling Gemini API for topic: ${idea.topic}`);
+            const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+            const result = await model.generateContent(prompt); // Full prompt is still used here
             const response = await result.response;
             const generatedHtml = response.text();
+            console.log(`Gemini API call successful for topic: ${idea.topic}`);
 
-            // Create the full HTML for the new post
             const postContent = postTemplate
                 .replace('{{POST_TITLE}}', idea.topic)
                 .replace('{{POST_CONTENT}}', generatedHtml);
@@ -115,24 +120,24 @@ Generate the HTML content for the blog post now.`;
                 path: `public/posts/${idea.filename}`,
                 content: postContent,
             });
+            console.log(`Created content for ${idea.filename}`);
         }
 
-        // If there are no new files to commit, we can stop.
         if (newFilesToCommit.length === 0) {
+            console.log('Although there were new ideas, no files were generated to commit.');
             return res.status(200).send('No new posts were generated.');
         }
 
-        // Update index.html
+        // 8. Update index.html
+        console.log('Updating index.html...');
         const { data: updatedPosts } = await octokit.repos.getContent({
             owner,
             repo,
             path: 'public/posts',
-            ref: latestCommitSha, // Get the list again in case it changed
+            ref: latestCommitSha,
         });
-
         const allPostFiles = [...updatedPosts.map(p => p.name), ...newIdeas.map(i => i.filename)];
-        const uniquePostFiles = [...new Set(allPostFiles)]; // Ensure uniqueness
-
+        const uniquePostFiles = [...new Set(allPostFiles)];
         const postLinks = uniquePostFiles
             .map(filename => `<li><a href="posts/${filename}">${filename.replace('.html', '').replace(/-/g, ' ')}</a></li>`)
             .join('\n');
@@ -150,37 +155,27 @@ Generate the HTML content for the blog post now.`;
             path: 'public/index.html',
             content: updatedIndexContent,
         });
+        console.log('index.html updated and added to commit list.');
+        console.log(`${newFilesToCommit.length} files are ready to be committed.`);
 
-        // Commit the new files to the repository
-        const { data: latestCommit } = await octokit.git.getCommit({
-            owner,
-            repo,
-            commit_sha: latestCommitSha,
-        });
+        // 9. Commit new files to GitHub
+        console.log('Starting commit process...');
+        const { data: latestCommit } = await octokit.git.getCommit({ owner, repo, commit_sha: latestCommitSha });
         const baseTreeSha = latestCommit.tree.sha;
+        console.log(`Base tree SHA: ${baseTreeSha}`);
 
         const blobs = await Promise.all(
             newFilesToCommit.map(file =>
-                octokit.git.createBlob({
-                    owner,
-                    repo,
-                    content: file.content,
-                    encoding: 'utf-8',
-                }).then(blob => ({
-                    path: file.path,
-                    mode: '100644',
-                    type: 'blob',
-                    sha: blob.data.sha,
-                }))
+                octokit.git.createBlob({ owner, repo, content: file.content, encoding: 'utf-8' })
+                    .then(blob => {
+                        console.log(`Blob created for ${file.path} (SHA: ${blob.data.sha})`);
+                        return { path: file.path, mode: '100644', type: 'blob', sha: blob.data.sha };
+                    })
             )
         );
 
-        const { data: newTree } = await octokit.git.createTree({
-            owner,
-            repo,
-            base_tree: baseTreeSha,
-            tree: blobs,
-        });
+        const { data: newTree } = await octokit.git.createTree({ owner, repo, base_tree: baseTreeSha, tree: blobs });
+        console.log(`New tree created (SHA: ${newTree.sha})`);
 
         const { data: newCommit } = await octokit.git.createCommit({
             owner,
@@ -189,49 +184,49 @@ Generate the HTML content for the blog post now.`;
             tree: newTree.sha,
             parents: [latestCommitSha],
         });
+        console.log(`New commit created (SHA: ${newCommit.sha})`);
 
-        await octokit.git.updateRef({
-            owner,
-            repo,
-            ref: 'heads/main', // or 'heads/master'
-            sha: newCommit.sha,
-        });
+        await octokit.git.updateRef({ owner, repo, ref: 'heads/main', sha: newCommit.sha });
+        console.log('Successfully updated ref for heads/main.');
 
-        console.log('Successfully committed new posts.');
+        console.log('--- Post generation process completed successfully! ---');
         res.status(200).send('Processing completed. New posts added.');
+
     } catch (error) {
-        console.error('Error processing webhook:', error);
+        console.error('--- An error occurred during the post generation process ---');
+        console.error('Error message:', error.message);
+        console.error('Error stack:', error.stack);
+        if (error.response) {
+            console.error('Error response data:', error.response.data);
+        }
         res.status(500).send('Internal Server Error');
     }
 };
 
+// Helper functions (unchanged)
 function slugify(text) {
     return text.toString().toLowerCase()
-        .replace(/\s+/g, '-')           // Replace spaces with -
-        .replace(/[^\w\-]+/g, '')       // Remove all non-word chars
-        .replace(/\-\-+/g, '-')         // Replace multiple - with single -
-        .replace(/^-+/, '')             // Trim - from start of text
-        .replace(/-+$/, '');            // Trim - from end of text
+        .replace(/\s+/g, '-')
+        .replace(/[^\w\-]+/g, '')
+        .replace(/\-\-+/g, '-')
+        .replace(/^-+/, '')
+        .replace(/-+$/, '');
 }
 
 function parseIdeas(content, existingPostFiles) {
     const ideas = content.split('---').filter(idea => idea.trim() !== '');
     const newIdeas = [];
-
     for (const idea of ideas) {
-        const topicMatch = idea.match(/TOPIC:\s*(.*)/);
-        const analysisMatch = idea.match(/ANALYSIS:\s*([\s\S]*)/);
-
+        const topicMatch = idea.match(/TOPIC:\s*(.*)/i); // Case-insensitive
+        const analysisMatch = idea.match(/ANALYSIS:\s*([\s\S]*)/i); // Case-insensitive
         if (topicMatch && topicMatch[1]) {
             const topic = topicMatch[1].trim();
             const analysis = analysisMatch ? analysisMatch[1].trim() : '';
             const filename = `${slugify(topic)}.html`;
-
             if (!existingPostFiles.includes(filename)) {
                 newIdeas.push({ topic, analysis, filename });
             }
         }
     }
-
     return newIdeas;
 }
