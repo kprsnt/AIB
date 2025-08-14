@@ -11,4 +11,5 @@ ANALYSIS:
 - Explain what a starter is and how to feed it.
 - Basic recipe: flour, water, salt.
 - Key techniques: stretch and fold, bulk fermentation, proofing.
+- Common mistakes: over-proofing, weak starter.
 ---
