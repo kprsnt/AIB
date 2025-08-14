@@ -10,5 +10,5 @@ TOPIC: A Beginner's Guide to Sourdough Baking
 ANALYSIS:
 - Explain what a starter is and how to feed it.
 - Basic recipe: flour, water, salt.
-- Key techniques: stretch and fold, bulk fermentation, proofing.
+- Key techniques: stretch and fold, bulk fermentation, proofing
 ---
