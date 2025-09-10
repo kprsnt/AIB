@@ -17,8 +17,9 @@ const webhookSecret = process.env.WEBHOOK_SECRET;
 module.exports = async (req, res) => {
     console.log('Received a request to /api/generate-post');
 
-    // 1. Verify the webhook signature (TEMPORARILY DISABLED FOR DEBUGGING)
-    /*
+    // 1. Verify the webhook signature
+    // This is a security measure to ensure that the request is coming from GitHub.
+    // Make sure the WEBHOOK_SECRET environment variable is set correctly in your deployment.
     try {
         const signature = req.headers['x-hub-signature-256'];
         if (!signature) {
@@ -31,7 +32,7 @@ module.exports = async (req, res) => {
         const calculatedSignature = `sha256=${hmac.digest('hex')}`;
 
         if (signature !== calculatedSignature) {
-            console.error('Webhook signature does not match.');
+            console.error('Webhook signature does not match. Check your WEBHOOK_SECRET.');
             return res.status(401).send('Unauthorized: Invalid signature.');
         }
         console.log('Webhook signature verified successfully.');
@@ -39,17 +40,20 @@ module.exports = async (req, res) => {
         console.error('Error during webhook signature verification:', error);
         return res.status(500).send('Internal Server Error during verification.');
     }
-    */
-    console.log('SECURITY WARNING: Webhook signature verification is temporarily disabled for debugging.');
 
 
-    // 2. Check the push event
-    const pushRef = req.body.ref;
+    // 2. Check the push event and determine branch
+    const pushRef = req.body.ref; // e.g., 'refs/heads/main'
     console.log(`Push event for ref: ${pushRef}`);
-    if (pushRef !== 'refs/heads/main' && pushRef !== 'refs/heads/master') {
-        console.log('Push was not to the main branch, skipping.');
-        return res.status(200).send('Push was not to the main branch, skipping.');
+
+    if (!pushRef || !pushRef.startsWith('refs/heads/')) {
+        console.log('Push event was not for a branch, skipping.');
+        return res.status(200).send('Push was not a branch push, skipping.');
     }
+    const branchName = pushRef.substring('refs/heads/'.length);
+    const branchRef = `heads/${branchName}`;
+    console.log(`Processing push to branch: ${branchName}`);
+
 
     try {
         console.log('Starting post generation process...');
@@ -58,32 +62,54 @@ module.exports = async (req, res) => {
         const { data: refData } = await octokit.git.getRef({
             owner,
             repo,
-            ref: 'heads/main',
+            ref: branchRef,
         });
         const latestCommitSha = refData.object.sha;
         console.log(`Latest commit SHA on main branch is: ${latestCommitSha}`);
 
-        // 4. Fetch ideas.md content
-        console.log('Fetching ideas.md...');
-        const { data: ideasFile } = await octokit.repos.getContent({
-            owner,
-            repo,
-            path: 'ideas.md',
-            ref: latestCommitSha,
-        });
-        const ideasContent = Buffer.from(ideasFile.content, 'base64').toString('utf8');
-        console.log(`ideas.md content fetched (length: ${ideasContent.length}).`);
+        // 4. Fetch and parse ideas.md
+        let ideasContent;
+        try {
+            console.log('Fetching ideas.md...');
+            const { data: ideasFile } = await octokit.repos.getContent({
+                owner,
+                repo,
+                path: 'ideas.md',
+                ref: latestCommitSha,
+            });
+            ideasContent = Buffer.from(ideasFile.content, 'base64').toString('utf8');
+            console.log(`Successfully fetched ideas.md (length: ${ideasContent.length}).`);
+        } catch (error) {
+            if (error.status === 404) {
+                console.log('ideas.md not found in the repository. Nothing to do.');
+                return res.status(200).send('ideas.md not found. No new ideas to process.');
+            }
+            console.error('Failed to fetch ideas.md:', error);
+            throw new Error('Could not retrieve ideas.md from the repository.');
+        }
+
 
         // 5. Fetch existing posts
-        console.log('Fetching existing posts from public/posts...');
-        const { data: existingPosts } = await octokit.repos.getContent({
-            owner,
-            repo,
-            path: 'public/posts',
-            ref: latestCommitSha,
-        });
-        const existingPostFiles = existingPosts.map(file => file.name);
-        console.log(`Found ${existingPostFiles.length} existing posts:`, existingPostFiles);
+        let existingPostFiles = [];
+        try {
+            console.log('Fetching existing posts from public/posts...');
+            const { data: existingPosts } = await octokit.repos.getContent({
+                owner,
+                repo,
+                path: 'public/posts',
+                ref: latestCommitSha,
+            });
+            existingPostFiles = existingPosts.map(file => file.name);
+            console.log(`Found ${existingPostFiles.length} existing posts:`, existingPostFiles);
+        } catch (error) {
+            if (error.status === 404) {
+                console.log('The public/posts directory does not exist yet. Assuming no posts exist.');
+                existingPostFiles = []; // Directory doesn't exist, so no posts
+            } else {
+                console.error('Failed to fetch existing posts:', error);
+                throw new Error('Could not retrieve existing posts from the repository.');
+            }
+        }
 
         // 6. Parse ideas and identify new ones
         const newIdeas = parseIdeas(ideasContent, existingPostFiles);
@@ -105,15 +131,28 @@ module.exports = async (req, res) => {
         console.log('Post template fetched successfully.');
 
         for (const idea of newIdeas) {
-            console.log(`--- Generating post for: ${idea.topic} ---`);
-            const prompt = `You are an expert blog writer...`; // Keeping it short for the log
+            console.log(`--- Generating content for: "${idea.topic}" ---`);
+            const prompt = `
+                You are an expert technical blog writer specializing in clear, engaging, and informative content.
+                Your response must be the raw HTML content for the blog post body. Do not include <html>, <head>, or <body> tags.
+                The topic for this blog post is: "${idea.topic}".
+                Use the following analysis to guide your writing:
+                ${idea.analysis}
+            `;
 
-            console.log(`Calling Gemini API for topic: ${idea.topic}`);
-            const model = genAI.getGenerativeModel({ model: "gemini-pro" });
-            const result = await model.generateContent(prompt); // Full prompt is still used here
-            const response = await result.response;
-            const generatedHtml = response.text();
-            console.log(`Gemini API call successful for topic: ${idea.topic}`);
+            let generatedHtml;
+            try {
+                console.log(`Calling Gemini API for topic: "${idea.topic}"`);
+                const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+                const result = await model.generateContent(prompt);
+                const response = await result.response;
+                generatedHtml = response.text();
+                console.log(`Successfully generated content for "${idea.topic}"`);
+            } catch (error) {
+                console.error(`Failed to generate content for topic "${idea.topic}". Error: ${error.message}`);
+                console.error(`Skipping this idea and continuing with the next one.`);
+                continue; // Skip to the next idea
+            }
 
             const postContent = postTemplate
                 .replace('{{POST_TITLE}}', idea.topic)
@@ -133,16 +172,14 @@ module.exports = async (req, res) => {
 
         // 8. Update index.html
         console.log('Updating index.html...');
-        const { data: updatedPosts } = await octokit.repos.getContent({
-            owner,
-            repo,
-            path: 'public/posts',
-            ref: latestCommitSha,
-        });
-        const allPostFiles = [...updatedPosts.map(p => p.name), ...newIdeas.map(i => i.filename)];
+        const allPostFiles = [...existingPostFiles, ...newIdeas.map(i => i.filename)];
         const uniquePostFiles = [...new Set(allPostFiles)];
         const postLinks = uniquePostFiles
-            .map(filename => `<li><a href="posts/${filename}">${filename.replace('.html', '').replace(/-/g, ' ')}</a></li>`)
+            .sort() // Sort alphabetically for consistent order
+            .map(filename => {
+                const title = filename.replace('.html', '').replace(/-/g, ' ');
+                return `<li><a href="posts/${filename}">${title}</a></li>`;
+            })
             .join('\n');
 
         const { data: indexFile } = await octokit.repos.getContent({
@@ -152,7 +189,8 @@ module.exports = async (req, res) => {
             ref: latestCommitSha,
         });
         const indexContent = Buffer.from(indexFile.content, 'base64').toString('utf8');
-        const updatedIndexContent = indexContent.replace('<!-- POSTS_LIST -->', `<ul>\n${postLinks}\n</ul>`);
+        // Use a more robust regex to replace the content, in case the list is already there.
+        const updatedIndexContent = indexContent.replace(/<ul>[\s\S]*<\/ul>|<!-- POSTS_LIST -->/, `<ul>\n${postLinks}\n</ul>`);
 
         newFilesToCommit.push({
             path: 'public/index.html',
@@ -162,35 +200,40 @@ module.exports = async (req, res) => {
         console.log(`${newFilesToCommit.length} files are ready to be committed.`);
 
         // 9. Commit new files to GitHub
-        console.log('Starting commit process...');
-        const { data: latestCommit } = await octokit.git.getCommit({ owner, repo, commit_sha: latestCommitSha });
-        const baseTreeSha = latestCommit.tree.sha;
-        console.log(`Base tree SHA: ${baseTreeSha}`);
+        try {
+            console.log('Starting commit process...');
+            const { data: latestCommit } = await octokit.git.getCommit({ owner, repo, commit_sha: latestCommitSha });
+            const baseTreeSha = latestCommit.tree.sha;
+            console.log(`Base tree SHA: ${baseTreeSha}`);
 
-        const blobs = await Promise.all(
-            newFilesToCommit.map(file =>
-                octokit.git.createBlob({ owner, repo, content: file.content, encoding: 'utf-8' })
-                    .then(blob => {
-                        console.log(`Blob created for ${file.path} (SHA: ${blob.data.sha})`);
-                        return { path: file.path, mode: '100644', type: 'blob', sha: blob.data.sha };
-                    })
-            )
-        );
+            const blobs = await Promise.all(
+                newFilesToCommit.map(file =>
+                    octokit.git.createBlob({ owner, repo, content: file.content, encoding: 'utf-8' })
+                        .then(blob => {
+                            console.log(`Blob created for ${file.path} (SHA: ${blob.data.sha})`);
+                            return { path: file.path, mode: '100644', type: 'blob', sha: blob.data.sha };
+                        })
+                )
+            );
 
-        const { data: newTree } = await octokit.git.createTree({ owner, repo, base_tree: baseTreeSha, tree: blobs });
-        console.log(`New tree created (SHA: ${newTree.sha})`);
+            const { data: newTree } = await octokit.git.createTree({ owner, repo, base_tree: baseTreeSha, tree: blobs });
+            console.log(`New tree created (SHA: ${newTree.sha})`);
 
-        const { data: newCommit } = await octokit.git.createCommit({
-            owner,
-            repo,
-            message: 'feat: Add new blog posts from ideas.md',
-            tree: newTree.sha,
-            parents: [latestCommitSha],
-        });
-        console.log(`New commit created (SHA: ${newCommit.sha})`);
+            const { data: newCommit } = await octokit.git.createCommit({
+                owner,
+                repo,
+                message: 'feat: Add new blog posts from ideas.md',
+                tree: newTree.sha,
+                parents: [latestCommitSha],
+            });
+            console.log(`New commit created (SHA: ${newCommit.sha})`);
 
-        await octokit.git.updateRef({ owner, repo, ref: 'heads/main', sha: newCommit.sha });
-        console.log('Successfully updated ref for heads/main.');
+            await octokit.git.updateRef({ owner, repo, ref: branchRef, sha: newCommit.sha });
+            console.log(`Successfully updated ref for ${branchRef}.`);
+        } catch (error) {
+            console.error('Failed to commit new files to GitHub:', error);
+            throw new Error('Could not commit new files to the repository.');
+        }
 
         console.log('--- Post generation process completed successfully! ---');
         res.status(200).send('Processing completed. New posts added.');
@@ -206,16 +249,17 @@ module.exports = async (req, res) => {
     }
 };
 
-// Helper functions (unchanged)
+// Helper function to convert a string into a URL-friendly slug
 function slugify(text) {
-    return text.toString().toLowerCase()
-        .replace(/\s+/g, '-')
-        .replace(/[^\w\-]+/g, '')
-        .replace(/\-\-+/g, '-')
-        .replace(/^-+/, '')
-        .replace(/-+$/, '');
+    return text.toString().toLowerCase().trim()
+        .replace(/\s+/g, '-')           // Replace spaces with -
+        .replace(/[^\w\-]+/g, '')       // Remove all non-word chars
+        .replace(/\-\-+/g, '-')         // Replace multiple - with single -
+        .replace(/^-+/, '')             // Trim - from start of text
+        .replace(/-+$/, '');            // Trim - from end of text
 }
 
+// Helper function to parse the ideas from ideas.md
 function parseIdeas(content, existingPostFiles) {
     const ideas = content.split('---').filter(idea => idea.trim() !== '');
     const newIdeas = [];
